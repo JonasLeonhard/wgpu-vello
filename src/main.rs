@@ -113,16 +113,14 @@ impl Renderer3D {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"), // 1.
+                entry_point: Some("vs_main"),
                 buffers: &[Vertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                // 3.
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    // 4.
                     format: surface.format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
@@ -130,25 +128,22 @@ impl Renderer3D {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw, // 2.
+                front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
-                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                 polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLIP_CONTROL
                 unclipped_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
-            depth_stencil: None, // 1.
+            depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: 1,                         // 2.
-                mask: !0,                         // 3.
-                alpha_to_coverage_enabled: false, // 4.
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
             },
-            multiview: None, // 5.
-            cache: None,     // 6.
+            multiview: None,
+            cache: None,
         });
 
         Self {
@@ -202,7 +197,7 @@ impl ApplicationHandler for App<'_> {
             }
         };
 
-        // create surface for both renderers
+        // create surface for 3d & 2d renderers
         let size = window.inner_size();
         let mut render_context = RenderContext::new();
         let surface_future = render_context.create_surface(
@@ -367,10 +362,10 @@ fn render(
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm, // Use Rgba8Unorm format for Vello
+            format: surface.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING, // Add STORAGE_BINDING flag
+                | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
     let texture_2d_view = texture_2d.create_view(&wgpu::TextureViewDescriptor::default());
@@ -434,10 +429,8 @@ fn render(
             .expect("failed to render to vello texture");
     }
 
-    // Combine the 3D and 2D render textures with into the surface_texture render_pass
+    // Combine the 3D and 2D render textures into the surface_texture
     {
-        // TODO
-        //
         let sampler = device_handle
             .device
             .create_sampler(&wgpu::SamplerDescriptor::default());
