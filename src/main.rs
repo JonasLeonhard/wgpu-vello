@@ -1,111 +1,211 @@
 use anyhow::Result;
-use cgmath::{Matrix4, Rad};
+use bytemuck::{Pod, Zeroable};
+use log::{error, info};
+use peniko::Color;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 use vello::kurbo::{Affine, Circle, Ellipse, Line, RoundedRect, Stroke};
-use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use wgpu::util::DeviceExt;
+use wgpu::{Buffer, RenderPipeline};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::error::EventLoopError;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::window::Window;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowId};
 
-use bytemuck::{Pod, Zeroable};
-use vello::wgpu;
-
-/// Simple struct to hold the state of the renderer
-#[derive(Debug)]
-pub struct ActiveRenderState<'s> {
-    // The fields MUST be in this order, so that the surface is dropped before the window
-    surface: RenderSurface<'s>,
-    window: Arc<Window>,
+struct State {
+    last_update: Instant,
 }
 
-enum RenderState<'s> {
-    Active(ActiveRenderState<'s>),
-    // Cache a window so that it can be reused when the app is resumed after being suspended
-    Suspended(Option<Arc<Window>>),
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            last_update: Instant::now(),
+        }
+    }
 }
 
-// 3D rendering structs
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Vertex {
     position: [f32; 3],
     color: [f32; 3],
 }
 
 impl Vertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+
     fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            array_stride: mem::size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-            ],
+            attributes: &Self::ATTRIBS,
         }
     }
 }
 
-// 3D rendering resources
-struct Render3D {
-    pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+struct Renderer3D {
+    render_pipeline: RenderPipeline,
+    vertex_buffer: Buffer,
+    index_buffer: Buffer,
+    num_vertices: u32,
     num_indices: u32,
-    transform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
 }
 
-struct App<'s> {
-    // The vello RenderContext which is a global context that lasts for the
-    // lifetime of the application
-    context: RenderContext,
+impl Renderer3D {
+    async fn new(render_context: &RenderContext, surface: &RenderSurface<'_>) -> Self {
+        const VERTICES: &[Vertex] = &[
+            Vertex {
+                position: [-0.0868241, 0.49240386, 0.0],
+                color: [0.5, 0.0, 0.5],
+            }, // A
+            Vertex {
+                position: [-0.49513406, 0.06958647, 0.0],
+                color: [0.5, 0.0, 0.5],
+            }, // B
+            Vertex {
+                position: [-0.21918549, -0.44939706, 0.0],
+                color: [0.5, 0.0, 0.5],
+            }, // C
+            Vertex {
+                position: [0.35966998, -0.3473291, 0.0],
+                color: [0.5, 0.0, 0.5],
+            }, // D
+            Vertex {
+                position: [0.44147372, 0.2347359, 0.0],
+                color: [0.5, 0.0, 0.5],
+            }, // E
+        ];
+        const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4];
 
-    // An array of renderers, one per wgpu device
-    renderers: Vec<Option<Renderer>>,
+        let device = &render_context.devices[surface.dev_id].device;
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader/shader.wgsl"));
 
-    // State for our example where we store the winit Window and the wgpu Surface
-    state: RenderState<'s>,
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
 
-    // A vello Scene which is a data structure which allows one to build up a
-    // description a scene to be drawn (with paths, fills, images, text, etc)
-    // which is then passed to a renderer for rendering
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let num_vertices = VERTICES.len() as u32;
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let num_indices = INDICES.len() as u32;
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"), // 1.
+                buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                // 3.
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    // 4.
+                    format: surface.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw, // 2.
+                cull_mode: Some(wgpu::Face::Back),
+                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
+                polygon_mode: wgpu::PolygonMode::Fill,
+                // Requires Features::DEPTH_CLIP_CONTROL
+                unclipped_depth: false,
+                // Requires Features::CONSERVATIVE_RASTERIZATION
+                conservative: false,
+            },
+            depth_stencil: None, // 1.
+            multisample: wgpu::MultisampleState {
+                count: 1,                         // 2.
+                mask: !0,                         // 3.
+                alpha_to_coverage_enabled: false, // 4.
+            },
+            multiview: None, // 5.
+            cache: None,     // 6.
+        });
+
+        Self {
+            render_pipeline,
+            vertex_buffer,
+            num_vertices,
+            index_buffer,
+            num_indices,
+        }
+    }
+}
+struct Renderer2D {
     scene: Scene,
+    vello: Renderer,
+}
 
-    // 3D rendering resources
-    render_3d: Option<Render3D>,
+impl Renderer2D {
+    fn new(render_cx: &RenderContext, surface: &RenderSurface<'_>) -> Self {
+        Self {
+            scene: Scene::new(),
+            vello: Renderer::new(
+                &render_cx.devices[surface.dev_id].device,
+                RendererOptions {
+                    surface_format: Some(surface.format),
+                    use_cpu: false,
+                    antialiasing_support: vello::AaSupport::all(),
+                    num_init_threads: NonZeroUsize::new(1),
+                },
+            )
+            .expect("Couldn't create renderer"),
+        }
+    }
+}
 
-    // Rotation angle for animation
-    rotation: f32,
+#[derive(Default)]
+pub struct App<'s> {
+    window: Option<Arc<Window>>,
+    renderer_3d: Option<Renderer3D>,
+    renderer_2d: Option<Renderer2D>,
+    render_context: Option<RenderContext>,
+    surface: Option<RenderSurface<'s>>,
+    state: Option<State>,
 }
 
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let RenderState::Suspended(cached_window) = &mut self.state else {
-            return;
+        let window = match event_loop.create_window(Window::default_attributes()) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                return error!("Failed to create window: {}", err);
+            }
         };
 
-        // Get the winit window cached in a previous Suspended event or else create a new window
-        let window = cached_window
-            .take()
-            .unwrap_or_else(|| create_winit_window(event_loop));
-
-        // Create a vello Surface
+        // create surface for both renderers
         let size = window.inner_size();
-        let surface_future = self.context.create_surface(
+        let mut render_context = RenderContext::new();
+        let surface_future = render_context.create_surface(
             window.clone(),
             size.width,
             size.height,
@@ -113,635 +213,385 @@ impl ApplicationHandler for App<'_> {
         );
         let surface = pollster::block_on(surface_future).expect("Error creating surface");
 
-        // Create a vello Renderer for the surface (using its device id)
-        self.renderers
-            .resize_with(self.context.devices.len(), || None);
-        self.renderers[surface.dev_id]
-            .get_or_insert_with(|| create_vello_renderer(&self.context, &surface));
-
-        // Initialize 3D rendering resources
-        self.render_3d = Some(create_3d_pipeline(
-            &self.context.devices[surface.dev_id].device,
-            surface.format,
-        ));
-
-        println!("Surface format: {:?}", surface.format);
-
-        // Save the Window and Surface to a state variable
-        self.state = RenderState::Active(ActiveRenderState { window, surface });
+        self.window = Some(window);
+        self.renderer_3d = Some(pollster::block_on(Renderer3D::new(
+            &render_context,
+            &surface,
+        )));
+        self.renderer_2d = Some(Renderer2D::new(&render_context, &surface));
+        self.render_context = Some(render_context);
+        self.surface = Some(surface);
+        self.state = Some(State::default());
     }
 
-    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        if let RenderState::Active(state) = &self.state {
-            self.state = RenderState::Suspended(Some(state.window.clone()));
-        }
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        window_id: winit::window::WindowId,
-        event: WindowEvent,
-    ) {
-        // Ignore the event (return from the function) if
-        //   - we have no render_state
-        //   - OR the window id of the event doesn't match the window id of our render_state
-        //
-        // Else extract a mutable reference to the render state from its containing option for use below
-        let render_state = match &mut self.state {
-            RenderState::Active(state) if state.window.id() == window_id => state,
-            _ => return,
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(window) = self.window.as_ref() else {
+            return info!("Skip window_event handling. We have no window");
+        };
+        let Some(render_context) = self.render_context.as_mut() else {
+            return info!("Skip window_event handling. We have no render_context");
+        };
+        let Some(renderer_3d) = self.renderer_3d.as_mut() else {
+            return info!("Skip window_event handling. We have no renderer_3d");
+        };
+        let Some(renderer_2d) = self.renderer_2d.as_mut() else {
+            return info!("Skip window_event handling. We have no renderer_2d");
+        };
+        let Some(surface) = self.surface.as_mut() else {
+            return info!("Skip window_event handling. We have no surface");
+        };
+        let Some(state) = self.state.as_mut() else {
+            return info!("Skip window_event handling. We have no state");
         };
 
         match event {
-            // Exit the event loop when a close is requested (e.g. window's close button is pressed)
-            WindowEvent::CloseRequested => event_loop.exit(),
-
-            // Resize the surface when the window is resized
-            WindowEvent::Resized(size) => {
-                self.context
-                    .resize_surface(&mut render_state.surface, size.width, size.height);
+            WindowEvent::CloseRequested => {
+                info!("The close button was pressed; stopping");
+                event_loop.exit();
             }
-
-            // This is where all the rendering happens
+            WindowEvent::KeyboardInput {
+                device_id: _,
+                event,
+                is_synthetic: _,
+            } => {
+                info!("pressed key {:?}", event);
+            }
             WindowEvent::RedrawRequested => {
-                // Empty the scene of objects to draw
-                self.scene.reset();
+                let now = Instant::now();
+                let _delta = now.duration_since(state.last_update).as_secs_f32();
+                state.last_update = now;
 
-                // Re-add the objects to draw to the scene
-                add_shapes_to_scene(&mut self.scene);
-
-                // Get the RenderSurface (surface + config)
-                let surface = &render_state.surface;
-
-                // Get the window size
-                let width = surface.config.width;
-                let height = surface.config.height;
-
-                // Get a handle to the device
-                let device_handle = &self.context.devices[surface.dev_id];
-
-                // Get the surface's texture
-                let surface_texture = surface
-                    .surface
-                    .get_current_texture()
-                    .expect("failed to get surface texture");
-
-                // Create view for surface texture
-                let view = surface_texture
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-
-                // 1. Create separate textures for 3D and Vello rendering
-                let texture_descriptor = wgpu::TextureDescriptor {
-                    label: Some("3D Render Texture"),
-                    size: wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: surface.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                };
-
-                // Create 3D texture
-                let texture_3d = device_handle.device.create_texture(&texture_descriptor);
-                let texture_3d_view =
-                    texture_3d.create_view(&wgpu::TextureViewDescriptor::default());
-
-                // Create Vello texture
-                let texture_vello = device_handle
-                    .device
-                    .create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Vello Render Texture"),
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm, // Use Rgba8Unorm format for Vello
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::TEXTURE_BINDING
-                            | wgpu::TextureUsages::STORAGE_BINDING, // Add STORAGE_BINDING flag
-                        view_formats: &[],
-                    });
-                let texture_vello_view =
-                    texture_vello.create_view(&wgpu::TextureViewDescriptor::default());
-
-                // Create a command encoder for all rendering
-                let mut encoder =
-                    device_handle
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Combined Render Encoder"),
-                        });
-
-                // 2. Render 3D scene to its texture
-                if let Some(render_3d) = &self.render_3d {
-                    // Update rotation for animation
-                    self.rotation += 0.01;
-
-                    let transform: Matrix4<f32> = Matrix4::from_angle_z(Rad(self.rotation));
-                    let transform_array: [[f32; 4]; 4] = transform.into();
-                    device_handle.queue.write_buffer(
-                        &render_3d.transform_buffer,
-                        0,
-                        bytemuck::cast_slice(&transform_array),
-                    );
-
-                    // Begin 3D render pass to the 3D texture
-                    {
-                        let mut render_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("3D Render Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &texture_3d_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.1, // Dark background for 3D scene
-                                            g: 0.1,
-                                            b: 0.1,
-                                            a: 1.0,
-                                        }),
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                            });
-
-                        // Draw 3D content
-                        render_pass.set_pipeline(&render_3d.pipeline);
-                        render_pass.set_bind_group(0, &render_3d.bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, render_3d.vertex_buffer.slice(..));
-                        render_pass.set_index_buffer(
-                            render_3d.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint16,
-                        );
-                        render_pass.draw_indexed(0..render_3d.num_indices, 0, 0..1);
-                    }
-                }
-
-                // Now render the 2D content with Vello
-                self.renderers[surface.dev_id]
-                    .as_mut()
-                    .unwrap()
-                    .render_to_texture(
-                        &device_handle.device,
-                        &device_handle.queue,
-                        &self.scene,
-                        &texture_vello_view,
-                        &vello::RenderParams {
-                            base_color: Color::new([0.0, 0.0, 0.0, 0.0]), // Transparent background
-                            width,
-                            height,
-                            antialiasing_method: AaConfig::Msaa16,
-                        },
-                    )
-                    .expect("failed to render to vello texture");
-
-                // 4. Create the final composition pass to combine both textures
+                // Render 3D:
                 {
-                    // Create a bind group layout for our textures
-                    let bind_group_layout = device_handle.device.create_bind_group_layout(
-                        &wgpu::BindGroupLayoutDescriptor {
-                            label: Some("Texture Bind Group Layout"),
-                            entries: &[
-                                // 3D texture binding
-                                wgpu::BindGroupLayoutEntry {
-                                    binding: 0,
-                                    visibility: wgpu::ShaderStages::FRAGMENT,
-                                    ty: wgpu::BindingType::Texture {
-                                        sample_type: wgpu::TextureSampleType::Float {
-                                            filterable: true,
-                                        },
-                                        view_dimension: wgpu::TextureViewDimension::D2,
-                                        multisampled: false,
-                                    },
-                                    count: None,
-                                },
-                                // Vello texture binding
-                                wgpu::BindGroupLayoutEntry {
-                                    binding: 1,
-                                    visibility: wgpu::ShaderStages::FRAGMENT,
-                                    ty: wgpu::BindingType::Texture {
-                                        sample_type: wgpu::TextureSampleType::Float {
-                                            filterable: true,
-                                        },
-                                        view_dimension: wgpu::TextureViewDimension::D2,
-                                        multisampled: false,
-                                    },
-                                    count: None,
-                                },
-                                // Sampler
-                                wgpu::BindGroupLayoutEntry {
-                                    binding: 2,
-                                    visibility: wgpu::ShaderStages::FRAGMENT,
-                                    ty: wgpu::BindingType::Sampler(
-                                        wgpu::SamplerBindingType::Filtering,
-                                    ),
-                                    count: None,
-                                },
-                            ],
-                        },
-                    );
-
-                    // Create the sampler for texture sampling
-                    let sampler = device_handle
-                        .device
-                        .create_sampler(&wgpu::SamplerDescriptor {
-                            address_mode_u: wgpu::AddressMode::ClampToEdge,
-                            address_mode_v: wgpu::AddressMode::ClampToEdge,
-                            address_mode_w: wgpu::AddressMode::ClampToEdge,
-                            mag_filter: wgpu::FilterMode::Linear,
-                            min_filter: wgpu::FilterMode::Linear,
-                            mipmap_filter: wgpu::FilterMode::Linear,
-                            ..Default::default()
-                        });
-
-                    // Create the bind group for our textures
-                    let bind_group =
-                        device_handle
-                            .device
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("Texture Bind Group"),
-                                layout: &bind_group_layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            &texture_3d_view,
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            &texture_vello_view,
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: wgpu::BindingResource::Sampler(&sampler),
-                                    },
-                                ],
-                            });
-
-                    // Create pipeline layout
-                    let pipeline_layout = device_handle.device.create_pipeline_layout(
-                        &wgpu::PipelineLayoutDescriptor {
-                            label: Some("Composition Pipeline Layout"),
-                            bind_group_layouts: &[&bind_group_layout],
-                            push_constant_ranges: &[],
-                        },
-                    );
-
-                    // Create the composition shader
-                    let comp_shader =
-                        device_handle
-                            .device
-                            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                                label: Some("Composition Shader"),
-                                source: wgpu::ShaderSource::Wgsl(
-                                    include_str!("shader/blend_textures.wgsl").into(),
-                                ),
-                            });
-
-                    // Create the composition pipeline
-                    let composition_pipeline = device_handle.device.create_render_pipeline(
-                        &wgpu::RenderPipelineDescriptor {
-                            label: Some("Composition Pipeline"),
-                            layout: Some(&pipeline_layout),
-                            vertex: wgpu::VertexState {
-                                module: &comp_shader,
-                                entry_point: Some("vs_main"),
-                                buffers: &[],
-                                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                            },
-                            fragment: Some(wgpu::FragmentState {
-                                module: &comp_shader,
-                                entry_point: Some("fs_main"),
-                                targets: &[Some(wgpu::ColorTargetState {
-                                    format: surface.format,
-                                    blend: Some(wgpu::BlendState::REPLACE),
-                                    write_mask: wgpu::ColorWrites::ALL,
-                                })],
-                                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                            }),
-                            primitive: wgpu::PrimitiveState {
-                                topology: wgpu::PrimitiveTopology::TriangleList,
-                                strip_index_format: None,
-                                front_face: wgpu::FrontFace::Ccw,
-                                cull_mode: None,
-                                polygon_mode: wgpu::PolygonMode::Fill,
-                                unclipped_depth: false,
-                                conservative: false,
-                            },
-                            depth_stencil: None,
-                            multisample: wgpu::MultisampleState {
-                                count: 1,
-                                mask: !0,
-                                alpha_to_coverage_enabled: false,
-                            },
-                            multiview: None,
-                            cache: None,
-                        },
-                    );
-
-                    // Execute composition pass to the surface
-                    let mut comp_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Composition Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.0,
-                                    g: 0.0,
-                                    b: 0.0,
-                                    a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-
-                    comp_pass.set_pipeline(&composition_pipeline);
-                    comp_pass.set_bind_group(0, &bind_group, &[]);
-                    comp_pass.draw(0..3, 0..1); // Draw a fullscreen triangle
+                    // TODO add a 3d scene?
                 }
 
-                // Submit all the work
-                device_handle
-                    .queue
-                    .submit(std::iter::once(encoder.finish()));
+                // Render 2D:
+                {
+                    let scene = &mut renderer_2d.scene;
+                    scene.reset();
 
-                // Present the surface texture
-                surface_texture.present();
-                device_handle.device.poll(wgpu::Maintain::Poll); // TODO: what does this do? https://github.com/linebender/vello/blob/v0.4.x/examples/simple/src/main.rs#L161
+                    // Draw an outlined rectangle
+                    let stroke = Stroke::new(6.0);
+                    let rect = RoundedRect::new(10.0, 10.0, 240.0, 240.0, 20.0);
+                    let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
+                    scene.stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
 
-                // Request another frame to keep animation going
-                render_state.window.request_redraw();
+                    // Draw a filled circle
+                    let circle = Circle::new((420.0, 200.0), 120.0);
+                    let circle_fill_color = Color::new([0.9529, 0.5451, 0.6588, 1.]);
+                    scene.fill(
+                        vello::peniko::Fill::NonZero,
+                        Affine::IDENTITY,
+                        circle_fill_color,
+                        None,
+                        &circle,
+                    );
+
+                    // Draw a filled ellipse
+                    let ellipse = Ellipse::new((250.0, 420.0), (100.0, 160.0), -90.0);
+                    let ellipse_fill_color = Color::new([0.7961, 0.651, 0.9686, 0.5]);
+                    scene.fill(
+                        vello::peniko::Fill::NonZero,
+                        Affine::IDENTITY,
+                        ellipse_fill_color,
+                        None,
+                        &ellipse,
+                    );
+
+                    // Draw a straight line
+                    let line = Line::new((260.0, 20.0), (620.0, 100.0));
+                    let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
+                    scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
+                }
+
+                render(render_context, surface, renderer_3d, renderer_2d);
+                window.request_redraw();
             }
-            _ => {}
+            WindowEvent::Resized(size) => {
+                // Reconfigures the size of the surface. We do not re-render
+                // here as this event is always followed up by redraw request.
+                render_context.resize_surface(surface, size.width, size.height);
+            }
+            _ => (),
         }
     }
 }
 
-fn main() -> Result<()> {
-    // Setup a bunch of state:
-    let mut app = App {
-        context: RenderContext::new(),
-        renderers: vec![],
-        state: RenderState::Suspended(None),
-        scene: Scene::new(),
-        render_3d: None,
-        rotation: 0.0,
-    };
+fn render(
+    render_context: &RenderContext,
+    surface: &RenderSurface,
+    renderer_3d: &mut Renderer3D,
+    renderer_2d: &mut Renderer2D,
+) {
+    let width = surface.config.width;
+    let height = surface.config.height;
+    let device_handle = &render_context.devices[surface.dev_id];
+    let surface_texture = surface
+        .surface
+        .get_current_texture()
+        .expect("failed to get surface texture");
+    let view = surface_texture
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Create and run a winit event loop
-    let event_loop = EventLoop::new()?;
-    event_loop
-        .run_app(&mut app)
-        .expect("Couldn't run event loop");
-    Ok(())
-}
-
-/// Helper function that creates a Winit window and returns it (wrapped in an Arc for sharing between threads)
-fn create_winit_window(event_loop: &ActiveEventLoop) -> Arc<Window> {
-    let attr = Window::default_attributes()
-        .with_inner_size(LogicalSize::new(1044, 800))
-        .with_resizable(true)
-        .with_title("Vello + 3D Example");
-    Arc::new(event_loop.create_window(attr).unwrap())
-}
-
-/// Helper function that creates a vello `Renderer` for a given `RenderContext` and `RenderSurface`
-fn create_vello_renderer(render_cx: &RenderContext, surface: &RenderSurface<'_>) -> Renderer {
-    Renderer::new(
-        &render_cx.devices[surface.dev_id].device,
-        RendererOptions {
-            surface_format: Some(surface.format),
-            use_cpu: false,
-            antialiasing_support: vello::AaSupport::all(),
-            num_init_threads: NonZeroUsize::new(1),
-        },
-    )
-    .expect("Couldn't create renderer")
-}
-
-/// Add shapes to a vello scene. This does not actually render the shapes, but adds them
-/// to the Scene data structure which represents a set of objects to draw.
-fn add_shapes_to_scene(scene: &mut Scene) {
-    // Draw an outlined rectangle
-    let stroke = Stroke::new(6.0);
-    let rect = RoundedRect::new(10.0, 10.0, 240.0, 240.0, 20.0);
-    let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
-    scene.stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
-
-    // Draw a filled circle
-    let circle = Circle::new((420.0, 200.0), 120.0);
-    let circle_fill_color = Color::new([0.9529, 0.5451, 0.6588, 1.]);
-    scene.fill(
-        vello::peniko::Fill::NonZero,
-        Affine::IDENTITY,
-        circle_fill_color,
-        None,
-        &circle,
-    );
-
-    // Draw a filled ellipse
-    let ellipse = Ellipse::new((250.0, 420.0), (100.0, 160.0), -90.0);
-    let ellipse_fill_color = Color::new([0.7961, 0.651, 0.9686, 0.5]);
-    scene.fill(
-        vello::peniko::Fill::NonZero,
-        Affine::IDENTITY,
-        ellipse_fill_color,
-        None,
-        &ellipse,
-    );
-
-    // Draw a straight line
-    let line = Line::new((260.0, 20.0), (620.0, 100.0));
-    let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
-    scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
-}
-
-fn create_3d_pipeline(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Render3D {
-    // Shader for 3D rendering
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("3D Shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader/shader.wgsl").into()),
-    });
-
-    // Create a uniform buffer for the transform matrix
-    let transform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Transform Buffer"),
-        size: 64, // 4x4 matrix (16 floats)
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    // Create a bind group layout for the transform matrix
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Transform Bind Group Layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
+    // Create 3D texture
+    let texture_3d = device_handle
+        .device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("3D Render Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
             },
-            count: None,
-        }],
-    });
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: surface.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+    let texture_3d_view = texture_3d.create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Create a bind group for the transform matrix
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Transform Bind Group"),
-        layout: &bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: transform_buffer.as_entire_binding(),
-        }],
-    });
+    // Create 2D texture
+    let texture_2d = device_handle
+        .device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("2D Render Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm, // Use Rgba8Unorm format for Vello
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING, // Add STORAGE_BINDING flag
+            view_formats: &[],
+        });
+    let texture_2d_view = texture_2d.create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Create pipeline layout
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("3D Pipeline Layout"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
-    });
+    let mut encoder =
+        device_handle
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
 
-    // Create render pipeline
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("3D Render Pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[Vertex::desc()],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::SrcAlpha,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
+    // renderer_3d.render_to_texture
+    {
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("3D Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &texture_3d_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.1, // Dark background for 3D scene
+                        g: 0.1,
+                        b: 0.1,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
             })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        multiview: None,
-        cache: None,
-    });
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
 
-    // Create vertex and index buffers for a simple cube
-    let vertices = [
-        // Front face (z = 0.5)
-        Vertex {
-            position: [-0.5, -0.5, 0.5],
-            color: [1.0, 0.0, 0.0],
-        },
-        Vertex {
-            position: [0.5, -0.5, 0.5],
-            color: [0.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [0.5, 0.5, 0.5],
-            color: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            position: [-0.5, 0.5, 0.5],
-            color: [1.0, 1.0, 0.0],
-        },
-        // Back face (z = -0.5)
-        Vertex {
-            position: [-0.5, -0.5, -0.5],
-            color: [1.0, 0.0, 1.0],
-        },
-        Vertex {
-            position: [0.5, -0.5, -0.5],
-            color: [0.0, 1.0, 1.0],
-        },
-        Vertex {
-            position: [0.5, 0.5, -0.5],
-            color: [0.5, 0.5, 1.0],
-        },
-        Vertex {
-            position: [-0.5, 0.5, -0.5],
-            color: [1.0, 0.5, 0.5],
-        },
-    ];
-
-    let indices: &[u16] = &[
-        // Front face
-        0, 1, 2, 2, 3, 0, // Back face
-        4, 5, 6, 6, 7, 4, // Left face
-        0, 3, 7, 7, 4, 0, // Right face
-        1, 5, 6, 6, 2, 1, // Top face
-        3, 2, 6, 6, 7, 3, // Bottom face
-        0, 4, 5, 5, 1, 0,
-    ];
-
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Vertex Buffer"),
-        contents: bytemuck::cast_slice(&vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Index Buffer"),
-        contents: bytemuck::cast_slice(indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-
-    Render3D {
-        pipeline,
-        vertex_buffer,
-        index_buffer,
-        num_indices: indices.len() as u32,
-        transform_buffer,
-        bind_group,
+        render_pass.set_pipeline(&renderer_3d.render_pipeline);
+        render_pass.set_vertex_buffer(0, renderer_3d.vertex_buffer.slice(..));
+        render_pass.set_index_buffer(
+            renderer_3d.index_buffer.slice(..),
+            wgpu::IndexFormat::Uint16,
+        ); // 1.
+        render_pass.draw_indexed(0..renderer_3d.num_indices, 0, 0..1);
     }
+
+    // renderer_2d.render_to_texture
+    {
+        renderer_2d
+            .vello
+            .render_to_texture(
+                &device_handle.device,
+                &device_handle.queue,
+                &renderer_2d.scene,
+                &texture_2d_view,
+                &vello::RenderParams {
+                    // the 2d render_texture has to have a transparent background,
+                    // because we overlay the 2d texture above the 3d rendering texture later.
+                    base_color: Color::new([0.0, 0.0, 0.0, 0.0]),
+                    width,
+                    height,
+                    antialiasing_method: AaConfig::Msaa16,
+                },
+            )
+            .expect("failed to render to vello texture");
+    }
+
+    // Combine the 3D and 2D render textures with into the surface_texture render_pass
+    {
+        // TODO
+        //
+        let sampler = device_handle
+            .device
+            .create_sampler(&wgpu::SamplerDescriptor::default());
+
+        let bind_group_layout =
+            device_handle
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Texture Bind Group Layout"),
+                    entries: &[
+                        // 3D texture binding
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        // 2D texture binding
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        // Sampler binding
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let bind_group = device_handle
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Texture Bind Group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_3d_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&texture_2d_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+
+        let pipeline_layout =
+            device_handle
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Composition Pipeline Layout"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let shader = device_handle
+            .device
+            .create_shader_module(wgpu::include_wgsl!("shader/blend_textures.wgsl"));
+
+        let composition_pipeline =
+            device_handle
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Composition Pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: surface.format,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: 1,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview: None,
+                    cache: None,
+                });
+
+        let mut comp_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Composition Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        comp_pass.set_pipeline(&composition_pipeline);
+        comp_pass.set_bind_group(0, &bind_group, &[]);
+        comp_pass.draw(0..3, 0..1); // The comp_pass shader draws a single fullscreen triangle
+    }
+
+    device_handle
+        .queue
+        .submit(std::iter::once(encoder.finish()));
+    surface_texture.present();
+}
+
+fn main() -> Result<(), EventLoopError> {
+    env_logger::init();
+
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut app = App::default();
+    event_loop.run_app(&mut app)
 }
