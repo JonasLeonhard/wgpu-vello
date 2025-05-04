@@ -2,7 +2,7 @@
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
 
-<img width="803" alt="Screenshot 2025-04-05 at 16 24 52" src="https://github.com/user-attachments/assets/d6824aa8-4138-4223-8f22-8ce246066476" />
+![Screenshot 2025-05-04 at 15 58 44](https://github.com/user-attachments/assets/c02d8a00-6b89-4934-a0bf-527ba7d720eb)
 
 Setup for combining a custom 3D WGPU renderer pipeline with 2D vello rendering.
 
