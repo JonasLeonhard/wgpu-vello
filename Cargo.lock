@@ -2259,7 +2259,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wgpu-ui"
+name = "wgpu-vello"
 version = "0.1.0"
 dependencies = [
  "anyhow",
