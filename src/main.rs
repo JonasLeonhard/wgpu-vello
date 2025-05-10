@@ -1,11 +1,11 @@
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use log::{error, info};
-use peniko::Color;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 use vello::kurbo::{Affine, Circle, Ellipse, Line, RoundedRect, Stroke};
+use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use wgpu::util::DeviceExt;
@@ -161,13 +161,15 @@ struct Renderer2D {
 }
 
 impl Renderer2D {
-    fn new(render_cx: &RenderContext, surface: &RenderSurface<'_>) -> Self {
+    fn new(render_context: &RenderContext, surface: &RenderSurface<'_>) -> Self {
         Self {
             scene: Scene::new(),
             vello: Renderer::new(
-                &render_cx.devices[surface.dev_id].device,
+                &render_context.devices[surface.dev_id].device,
                 RendererOptions {
-                    surface_format: Some(surface.format),
+                    // INFO: https://docs.rs/wgpu/24.0.3/wgpu/struct.PipelineCache.html - if you plan to
+                    // target android, you might want to add a Cache here.
+                    pipeline_cache: None,
                     use_cpu: false,
                     antialiasing_support: vello::AaSupport::all(),
                     num_init_threads: NonZeroUsize::new(1),
@@ -362,10 +364,8 @@ fn render(
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: surface.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
     let texture_2d_view = texture_2d.create_view(&wgpu::TextureViewDescriptor::default());
