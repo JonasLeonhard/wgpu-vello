@@ -1,11 +1,16 @@
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use log::{error, info};
+use parley::{
+    FontContext, FontFamily, FontStack, FontStyle, LayoutContext, PositionedLayoutItem,
+    StyleProperty,
+};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 use vello::kurbo::{Affine, Circle, Ellipse, Line, RoundedRect, Stroke};
-use vello::peniko::Color;
+use vello::peniko::color::palette;
+use vello::peniko::{Brush, Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use wgpu::util::DeviceExt;
@@ -158,6 +163,8 @@ impl Renderer3D {
 struct Renderer2D {
     scene: Scene,
     vello: Renderer,
+    font_cx: FontContext,
+    layout_cx: LayoutContext<Brush>,
 }
 
 impl Renderer2D {
@@ -176,6 +183,78 @@ impl Renderer2D {
                 },
             )
             .expect("Couldn't create renderer"),
+            font_cx: FontContext::new(),
+            layout_cx: LayoutContext::new(),
+        }
+    }
+
+    fn draw_text(
+        &mut self,
+        text_content: &str,
+        x_pos: f32,
+        y_pos: f32,
+        font_size: f32,
+        line_height: f32,
+        color: Color,
+        font_family: &str,
+    ) {
+        let mut builder =
+            self.layout_cx
+                .ranged_builder(&mut self.font_cx, text_content, 1.0, false);
+
+        // --- Styling for Parley ---
+        builder.push_default(StyleProperty::FontSize(font_size));
+        builder.push_default(StyleProperty::Brush(Brush::Solid(color)));
+        builder.push_default(StyleProperty::LineHeight(line_height));
+        builder.push_default(StyleProperty::FontStack(FontStack::Single(
+            FontFamily::Named(font_family.into()),
+        )));
+
+        let mut layout = builder.build(text_content);
+        layout.break_all_lines(None);
+
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+
+                let style = glyph_run.style();
+                let run_brush = &style.brush;
+
+                let mut x = glyph_run.offset();
+                let y = glyph_run.baseline();
+
+                let run = glyph_run.run();
+                let font = run.font();
+                let font_size = run.font_size();
+                let synthesis = run.synthesis();
+                let glyph_xform = synthesis
+                    .skew()
+                    .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+
+                let transform = Affine::translate(((x_pos + x) as f64, (y_pos + y) as f64));
+
+                self.scene
+                    .draw_glyphs(font)
+                    .font_size(font_size)
+                    .transform(transform)
+                    .glyph_transform(glyph_xform)
+                    .brush(run_brush)
+                    .draw(
+                        Fill::NonZero,
+                        glyph_run.glyphs().map(|glyph| {
+                            let gx = x + glyph.x;
+                            let gy = y - glyph.y;
+                            x += glyph.advance;
+                            vello::Glyph {
+                                id: glyph.id as _,
+                                x: gx,
+                                y: gy,
+                            }
+                        }),
+                    );
+            }
         }
     }
 }
@@ -300,6 +379,18 @@ impl ApplicationHandler for App<'_> {
                     let line = Line::new((260.0, 20.0), (620.0, 100.0));
                     let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
                     scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
+
+                    // TODO: refactor how this works. borrow err if used before Draw some text
+                    renderer_2d.draw_text(
+                        "Hello Vello!",              // text_content
+                        50.0,                        // x_pos (baseline start)
+                        350.0,                       // y_pos (baseline)
+                        100.0,                       // font_size
+                        1.0,                         // line_height
+                        palette::css::MEDIUM_PURPLE, // color
+                        "American Typewriter",       // Try to use this font if system has it.
+                                                     // Otherwise we use Payley's default system font
+                    );
                 }
 
                 render(render_context, surface, renderer_3d, renderer_2d);
