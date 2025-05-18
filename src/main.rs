@@ -2,8 +2,7 @@ use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use log::{error, info};
 use parley::{
-    FontContext, FontFamily, FontStack, FontStyle, LayoutContext, PositionedLayoutItem,
-    StyleProperty,
+    FontContext, FontFamily, FontStack, LayoutContext, PositionedLayoutItem, StyleProperty,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -187,28 +186,34 @@ impl Renderer2D {
             layout_cx: LayoutContext::new(),
         }
     }
+}
 
+pub trait ExtendedScene {
     fn draw_text(
         &mut self,
+        font_cx: &mut FontContext,
+        layout_cx: &mut LayoutContext<Brush>,
         text_content: &str,
-        x_pos: f32,
-        y_pos: f32,
-        font_size: f32,
-        line_height: f32,
-        color: Color,
-        font_family: &str,
+        xy: (f32, f32),
+        style_properties: &[StyleProperty<Brush>],
+    );
+}
+
+impl ExtendedScene for Scene {
+    fn draw_text(
+        &mut self,
+        font_cx: &mut FontContext,
+        layout_cx: &mut LayoutContext<Brush>,
+        text_content: &str,
+        xy: (f32, f32),
+        style_properties: &[StyleProperty<Brush>],
     ) {
-        let mut builder =
-            self.layout_cx
-                .ranged_builder(&mut self.font_cx, text_content, 1.0, false);
+        let mut builder = layout_cx.ranged_builder(font_cx, text_content, 1.0, false);
 
         // --- Styling for Parley ---
-        builder.push_default(StyleProperty::FontSize(font_size));
-        builder.push_default(StyleProperty::Brush(Brush::Solid(color)));
-        builder.push_default(StyleProperty::LineHeight(line_height));
-        builder.push_default(StyleProperty::FontStack(FontStack::Single(
-            FontFamily::Named(font_family.into()),
-        )));
+        for style_property in style_properties {
+            builder.push_default(style_property.clone());
+        }
 
         let mut layout = builder.build(text_content);
         layout.break_all_lines(None);
@@ -233,10 +238,9 @@ impl Renderer2D {
                     .skew()
                     .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
 
-                let transform = Affine::translate(((x_pos + x) as f64, (y_pos + y) as f64));
+                let transform = Affine::translate(((xy.0 + x) as f64, (xy.1 + y) as f64));
 
-                self.scene
-                    .draw_glyphs(font)
+                self.draw_glyphs(font)
                     .font_size(font_size)
                     .transform(transform)
                     .glyph_transform(glyph_xform)
@@ -258,7 +262,6 @@ impl Renderer2D {
         }
     }
 }
-
 #[derive(Default)]
 pub struct App<'s> {
     window: Option<Arc<Window>>,
@@ -301,23 +304,23 @@ impl ApplicationHandler for App<'_> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(window) = self.window.as_ref() else {
-            return info!("Skip window_event handling. We have no window");
-        };
-        let Some(render_context) = self.render_context.as_mut() else {
-            return info!("Skip window_event handling. We have no render_context");
-        };
-        let Some(renderer_3d) = self.renderer_3d.as_mut() else {
-            return info!("Skip window_event handling. We have no renderer_3d");
-        };
-        let Some(renderer_2d) = self.renderer_2d.as_mut() else {
-            return info!("Skip window_event handling. We have no renderer_2d");
-        };
-        let Some(surface) = self.surface.as_mut() else {
-            return info!("Skip window_event handling. We have no surface");
-        };
-        let Some(state) = self.state.as_mut() else {
-            return info!("Skip window_event handling. We have no state");
+        let (
+            Some(window),
+            Some(render_context),
+            Some(renderer_3d),
+            Some(renderer_2d),
+            Some(surface),
+            Some(state),
+        ) = (
+            self.window.as_ref(),
+            self.render_context.as_mut(),
+            self.renderer_3d.as_mut(),
+            self.renderer_2d.as_mut(),
+            self.surface.as_mut(),
+            self.state.as_mut(),
+        )
+        else {
+            return info!("Skip window_event handling. Missing required components");
         };
 
         match event {
@@ -346,6 +349,16 @@ impl ApplicationHandler for App<'_> {
                 {
                     let scene = &mut renderer_2d.scene;
                     scene.reset();
+
+                    // -- Style Tokens for text rendering
+                    let h1_styles = vec![
+                        StyleProperty::FontSize(100.0),
+                        StyleProperty::Brush(Brush::Solid(palette::css::MEDIUM_PURPLE)),
+                        StyleProperty::LineHeight(1.0),
+                        StyleProperty::FontStack(FontStack::Single(FontFamily::Named(
+                            "American Typewriter".into(),
+                        ))),
+                    ];
 
                     // Draw an outlined rectangle
                     let stroke = Stroke::new(6.0);
@@ -380,16 +393,12 @@ impl ApplicationHandler for App<'_> {
                     let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
                     scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
 
-                    // TODO: refactor how this works. borrow err if used before Draw some text
-                    renderer_2d.draw_text(
-                        "Hello Vello!",              // text_content
-                        50.0,                        // x_pos (baseline start)
-                        350.0,                       // y_pos (baseline)
-                        100.0,                       // font_size
-                        1.0,                         // line_height
-                        palette::css::MEDIUM_PURPLE, // color
-                        "American Typewriter",       // Try to use this font if system has it.
-                                                     // Otherwise we use Payley's default system font
+                    scene.draw_text(
+                        &mut renderer_2d.font_cx,
+                        &mut renderer_2d.layout_cx,
+                        "Hello Vello!",
+                        (50.0, 350.0),
+                        &h1_styles,
                     );
                 }
 
